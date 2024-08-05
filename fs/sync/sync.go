@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -19,6 +21,7 @@ import (
 	"github.com/rclone/rclone/fs/march"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/errcount"
+	"github.com/shirou/gopsutil/v3/load"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -94,6 +97,8 @@ type syncCopyMove struct {
 	setDirModTimes         []setDirModTime        // directories that need their modtime set
 	setDirModTimesMaxLevel int                    // max level of the directories to set
 	modifiedDirs           map[string]struct{}    // dirs with changed contents (if s.setDirModTimeAfter)
+	loadAvg                uint32                 //load average data
+	diskQueue              uint32                 //disk queue snapshot
 }
 
 // For keeping track of delayed modtime sets
@@ -111,6 +116,16 @@ const (
 	trackRenamesStrategyHash trackRenamesStrategy = 1 << iota
 	trackRenamesStrategyModtime
 	trackRenamesStrategyLeaf
+)
+
+type WinNice int
+
+const (
+	VeryLow WinNice = iota
+	Low
+	Standard
+	High
+	VeryHigh
 )
 
 func (strategy trackRenamesStrategy) hash() bool {
@@ -479,8 +494,45 @@ func (s *syncCopyMove) pairRenamer(in *pipe, out *pipe, fraction int, wg *sync.W
 	}
 }
 
+/*
+ShouldThrottle decides whether the thread should be throttled
+based on
+* For non windows: Average load on the system and threshold configured.
+* For windows: Current Disk queue
+*/
+func (s *syncCopyMove) ShouldThrottle(id int) bool {
+	if !s.ci.Throttle {
+		return false
+	}
+
+	throttleCheck := func(currVal int) bool {
+		minVal, maxVal := s.ci.MinThreshold, s.ci.MaxThreshold
+		if currVal < minVal {
+			return false
+		} else if currVal >= maxVal {
+			return true
+		}
+		fraction := maxVal / s.ci.Transfers
+		if fraction == 0 {
+			fraction = 1
+		}
+
+		maxAllowedId := (maxVal - currVal) / fraction
+		return id > maxAllowedId
+	}
+
+	if runtime.GOOS == "windows" {
+		currQ := atomic.LoadUint32(&s.diskQueue)
+		return throttleCheck(int(currQ))
+	}
+
+	currAvg := int(atomic.LoadUint32(&s.loadAvg))
+	return throttleCheck(currAvg)
+}
+
 // pairCopyOrMove reads Objects on in and moves or copies them.
-func (s *syncCopyMove) pairCopyOrMove(ctx context.Context, in *pipe, fdst fs.Fs, fraction int, wg *sync.WaitGroup) {
+func (s *syncCopyMove) pairCopyOrMove(ctx context.Context, in *pipe, fdst fs.Fs,
+	fraction int, wg *sync.WaitGroup, threadNum int) {
 	defer wg.Done()
 	var err error
 	for {
@@ -488,6 +540,13 @@ func (s *syncCopyMove) pairCopyOrMove(ctx context.Context, in *pipe, fdst fs.Fs,
 		if !ok {
 			return
 		}
+
+		//Throttling check
+		for s.ShouldThrottle(threadNum) {
+			fs.Debugf(nil, "Throttling thread:%d", threadNum)
+			time.Sleep(5 * time.Second)
+		}
+
 		src := pair.Src
 		dst := pair.Dst
 		if s.DoMove {
@@ -528,7 +587,7 @@ func (s *syncCopyMove) startTransfers() {
 	s.transfersWg.Add(s.ci.Transfers)
 	for i := 0; i < s.ci.Transfers; i++ {
 		fraction := (100 * i) / s.ci.Transfers
-		go s.pairCopyOrMove(s.ctx, s.toBeUploaded, s.fdst, fraction, &s.transfersWg)
+		go s.pairCopyOrMove(s.ctx, s.toBeUploaded, s.fdst, fraction, &s.transfersWg, i)
 	}
 }
 
@@ -913,6 +972,43 @@ func (s *syncCopyMove) tryRename(src fs.Object) bool {
 	return true
 }
 
+// Captures and stores the average load value
+func (s *syncCopyMove) monitorLoadAverage(ctx context.Context) {
+	uptimeTicker := time.NewTicker(5 * time.Second)
+	fs.Debugf(nil, "Starting MonitorLoadAverage")
+	for {
+		select {
+		case <-ctx.Done():
+			//Reset the loadAvg
+			fs.Debugf(nil, "Stopping MonitorLoadAverage")
+			atomic.StoreUint32(&s.loadAvg, 0)
+			atomic.StoreUint32(&s.diskQueue, 0)
+			return
+		case <-uptimeTicker.C:
+			if runtime.GOOS == "windows" {
+				dq, err := GetDiskQueue()
+				if err != nil {
+					continue
+				}
+				total := uint32(0)
+				for _, val := range dq {
+					total += val
+				}
+				atomic.StoreUint32(&s.diskQueue, total)
+			} else {
+				lv, err := load.Avg()
+				if err != nil {
+					continue
+				}
+
+				if lv != nil {
+					atomic.StoreUint32(&s.loadAvg, uint32(lv.Load1))
+				}
+			}
+		}
+	}
+}
+
 // Syncs fsrc into fdst
 //
 // If Delete is true then it deletes any files in fdst that aren't in fsrc
@@ -924,6 +1020,13 @@ func (s *syncCopyMove) run() error {
 	if operations.Same(s.fdst, s.fsrc) {
 		fs.Errorf(s.fdst, "Nothing to do as source and destination are the same")
 		return nil
+	}
+
+	//Start the load average monitor if enabled
+	if s.ci.Throttle {
+		ctx, cancel := context.WithCancel(context.Background())
+		go s.monitorLoadAverage(ctx)
+		defer cancel()
 	}
 
 	// Start background checking and transferring pipeline

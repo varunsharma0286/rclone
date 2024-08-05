@@ -528,6 +528,21 @@ var ConfigOptionsInfo = Options{{
 	Default: ".partial",
 	Help:    "Add partial-suffix to temporary file name when --inplace is not used",
 	Groups:  "Copy",
+}, {
+	Name:    "min_threshold",
+	Default: 10,
+	Help:    "Minimum value to be used as threshold for rclone throttling",
+	Groups:  "Sync,Copy",
+}, {
+	Name:    "max_threshold",
+	Default: 20,
+	Help:    "Max threshold value post which the transfers will be paused",
+	Groups:  "Sync,Copy",
+}, {
+	Name:    "throttle",
+	Default: false,
+	Help:    "Enabling throttling of rclone based on the load_threshold value",
+	Groups:  "Sync,Copy",
 }}
 
 // ConfigInfo is filesystem config options
@@ -635,6 +650,9 @@ type ConfigInfo struct {
 	Inplace                    bool              `config:"inplace"`      // Download directly to destination file instead of atomic download to temp/rename
 	PartialSuffix              string            `config:"partial_suffix"`
 	MetadataMapper             SpaceSepList      `config:"metadata_mapper"`
+	MinThreshold               int               `config:"min_threshold"` //Lower threshold post which we start throttling
+	MaxThreshold               int               `config:"max_threshold"` //Max threshold post which we will throttle all transfers
+	Throttle                   bool              `config:"throttle"`      //Flag to enable throttling
 }
 
 func init() {
